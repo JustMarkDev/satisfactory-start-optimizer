@@ -37,3 +37,13 @@ jobs:
         run: bun run check
       - name: Audit frontend dependencies
         run: bun audit
+
+  release:
+    name: Release
+    needs: ci
+    # always(): a skipped ancestor job would otherwise skip this job.
+    if: always() && github.event_name == 'push' && needs.ci.result == 'success'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
