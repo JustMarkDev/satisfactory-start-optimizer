@@ -223,19 +223,17 @@ fn estimate_altitude(
                 let dx = x - node.x;
                 let dy = y - node.y;
                 let dist_sq = dx * dx + dy * dy;
-                if dist_sq <= radius_cm_sq {
-                    if dist_sq < nearest[5].0 {
-                        let mut insert_pos = 5;
-                        while insert_pos > 0 && dist_sq < nearest[insert_pos - 1].0 {
-                            insert_pos -= 1;
-                        }
-                        for idx in (insert_pos + 1..6).rev() {
-                            nearest[idx] = nearest[idx - 1];
-                        }
-                        nearest[insert_pos] = (dist_sq, node.z);
-                        if count < 6 {
-                            count += 1;
-                        }
+                if dist_sq <= radius_cm_sq && dist_sq < nearest[5].0 {
+                    let mut insert_pos = 5;
+                    while insert_pos > 0 && dist_sq < nearest[insert_pos - 1].0 {
+                        insert_pos -= 1;
+                    }
+                    for idx in (insert_pos + 1..6).rev() {
+                        nearest[idx] = nearest[idx - 1];
+                    }
+                    nearest[insert_pos] = (dist_sq, node.z);
+                    if count < 6 {
+                        count += 1;
                     }
                 }
             }
@@ -245,10 +243,10 @@ fn estimate_altitude(
     if count > 0 {
         let mut total_weight = 0.0;
         let mut weighted_z = 0.0;
-        for i in 0..count {
-            let dist_m = nearest[i].0.sqrt() / 100.0;
+        for &(dist_sq, z) in nearest.iter().take(count) {
+            let dist_m = dist_sq.sqrt() / 100.0;
             let w = 1.0 / ((dist_m + 10.0) * (dist_m + 10.0));
-            weighted_z += nearest[i].1 * w;
+            weighted_z += z * w;
             total_weight += w;
         }
         weighted_z / total_weight
@@ -507,18 +505,19 @@ fn dist_to_polygon_edge(x: f64, y: f64, vs: &[(f64, f64)]) -> f64 {
 fn calculate_utility(
     x: f64,
     y: f64,
-    opt_nodes: &[OptNode],
-    spatial_grid: &SpatialGrid,
+    ctx: &SearchContext,
     config: &OptimizerConfig,
-    num_resources: usize,
-    weights_arr: &[f64],
-    epsilons_arr: &[f64],
-    res_to_idx: &HashMap<String, usize>,
-    waterwell_nodes: &[(f64, f64)],
-    land_mask: &LandMask,
-    land_accel: &LandAccel,
     quality: EvalQuality,
 ) -> f64 {
+    let opt_nodes = ctx.opt_nodes.as_slice();
+    let spatial_grid = &ctx.spatial_grid;
+    let num_resources = ctx.num_resources;
+    let weights_arr = ctx.weights_arr.as_slice();
+    let epsilons_arr = ctx.epsilons_arr.as_slice();
+    let res_to_idx = &ctx.res_to_idx;
+    let waterwell_nodes = ctx.waterwell_nodes.as_slice();
+    let land_mask = &ctx.land_mask;
+    let land_accel = &ctx.land_accel;
     let border_penalty = match land_border_penalty(x, y, land_mask, land_accel, quality) {
         Some(p) => p,
         None => return 0.0,
@@ -603,9 +602,9 @@ fn calculate_utility(
         flatness_mult = (-std_dev_m / 30.0).exp();
     }
 
-    for i in 0..num_resources {
-        if yields[i] > 1.0 {
-            yields[i] *= 1.0 + 0.1 * (yields[i] - 1.0);
+    for y in yields.iter_mut().take(num_resources) {
+        if *y > 1.0 {
+            *y *= 1.0 + 0.1 * (*y - 1.0);
         }
     }
 
@@ -698,34 +697,14 @@ fn calculate_utility(
 fn run_hill_climbing(
     start_x: f64,
     start_y: f64,
-    opt_nodes: &[OptNode],
-    spatial_grid: &SpatialGrid,
+    ctx: &SearchContext,
     config: &OptimizerConfig,
-    num_resources: usize,
-    weights_arr: &[f64],
-    epsilons_arr: &[f64],
-    res_to_idx: &HashMap<String, usize>,
-    waterwell_nodes: &[(f64, f64)],
-    land_mask: &LandMask,
-    land_accel: &LandAccel,
 ) -> OptimizationResult {
-    let util = |x: f64, y: f64| {
-        calculate_utility(
-            x,
-            y,
-            opt_nodes,
-            spatial_grid,
-            config,
-            num_resources,
-            weights_arr,
-            epsilons_arr,
-            res_to_idx,
-            waterwell_nodes,
-            land_mask,
-            land_accel,
-            EvalQuality::Fine,
-        )
-    };
+    let opt_nodes = ctx.opt_nodes.as_slice();
+    let spatial_grid = &ctx.spatial_grid;
+    let res_to_idx = &ctx.res_to_idx;
+    let waterwell_nodes = ctx.waterwell_nodes.as_slice();
+    let util = |x: f64, y: f64| calculate_utility(x, y, ctx, config, EvalQuality::Fine);
 
     let mut curr_x = start_x;
     let mut curr_y = start_y;
@@ -793,32 +772,32 @@ fn run_hill_climbing(
         let d_sq_3d = dx * dx + dy * dy + (dz * dz * 16.0);
         let d_sq_2d = dx * dx + dy * dy;
 
-        if d_sq_3d <= search_radius_sq {
-            if let Some(name) = inv_res_map.get(&node.res_idx) {
-                let purity_str = if node.multiplier > 1.5 {
-                    "Pure"
-                } else if node.multiplier < 0.8 {
-                    "Impure"
-                } else {
-                    "Normal"
-                };
-                let display_name = format!("{} {}", purity_str, name);
+        if d_sq_3d <= search_radius_sq
+            && let Some(name) = inv_res_map.get(&node.res_idx)
+        {
+            let purity_str = if node.multiplier > 1.5 {
+                "Pure"
+            } else if node.multiplier < 0.8 {
+                "Impure"
+            } else {
+                "Normal"
+            };
+            let display_name = format!("{} {}", purity_str, name);
 
-                if node.obstructed
-                    && (config.game_phase == crate::models::GamePhase::Phase1
-                        || config.game_phase == crate::models::GamePhase::Phase2)
-                {
-                    *obstructed_nodes.entry(display_name).or_insert(0) += 1;
-                } else {
-                    *local_nodes.entry(display_name).or_insert(0) += 1;
-                }
+            if node.obstructed
+                && (config.game_phase == crate::models::GamePhase::Phase1
+                    || config.game_phase == crate::models::GamePhase::Phase2)
+            {
+                *obstructed_nodes.entry(display_name).or_insert(0) += 1;
+            } else {
+                *local_nodes.entry(display_name).or_insert(0) += 1;
+            }
 
-                let d_m = d_sq_3d.sqrt() / 100.0;
-                let decay = decay_weight(d_m, d_m * d_m, config.sigma, config.decay_func);
-                let contribution = node_yield_contribution(node, decay, config.game_phase);
-                if contribution > 0.0 {
-                    *resource_yields.entry(name.clone()).or_insert(0.0) += contribution;
-                }
+            let d_m = d_sq_3d.sqrt() / 100.0;
+            let decay = decay_weight(d_m, d_m * d_m, config.sigma, config.decay_func);
+            let contribution = node_yield_contribution(node, decay, config.game_phase);
+            if contribution > 0.0 {
+                *resource_yields.entry(name.clone()).or_insert(0.0) += contribution;
             }
         }
 
@@ -885,21 +864,7 @@ struct SearchContext {
 
 impl SearchContext {
     fn utility(&self, x: f64, y: f64, config: &OptimizerConfig, quality: EvalQuality) -> f64 {
-        calculate_utility(
-            x,
-            y,
-            &self.opt_nodes,
-            &self.spatial_grid,
-            config,
-            self.num_resources,
-            &self.weights_arr,
-            &self.epsilons_arr,
-            &self.res_to_idx,
-            &self.waterwell_nodes,
-            &self.land_mask,
-            &self.land_accel,
-            quality,
-        )
+        calculate_utility(x, y, self, config, quality)
     }
 
     fn refine_from(
@@ -908,20 +873,7 @@ impl SearchContext {
         start_y: f64,
         config: &OptimizerConfig,
     ) -> OptimizationResult {
-        run_hill_climbing(
-            start_x,
-            start_y,
-            &self.opt_nodes,
-            &self.spatial_grid,
-            config,
-            self.num_resources,
-            &self.weights_arr,
-            &self.epsilons_arr,
-            &self.res_to_idx,
-            &self.waterwell_nodes,
-            &self.land_mask,
-            &self.land_accel,
-        )
+        run_hill_climbing(start_x, start_y, self, config)
     }
 }
 
@@ -1238,10 +1190,10 @@ fn top_n_results(
     }
 
     // Fall back to the single absolute best candidate if all were filtered out.
-    if kept.is_empty() {
-        if let Some(best) = absolute_best {
-            kept.push(best);
-        }
+    if kept.is_empty()
+        && let Some(best) = absolute_best
+    {
+        kept.push(best);
     }
 
     kept
@@ -1310,8 +1262,10 @@ mod tests {
     }
 
     fn config_for(resources: &[(&str, f64)]) -> OptimizerConfig {
-        let mut config = OptimizerConfig::default();
-        config.weights = HashMap::new();
+        let mut config = OptimizerConfig {
+            weights: HashMap::new(),
+            ..OptimizerConfig::default()
+        };
         for (name, weight) in resources {
             config.weights.insert((*name).to_string(), *weight);
         }
@@ -1346,13 +1300,17 @@ mod tests {
     fn test_ignore_spawns() {
         let nodes = crate::data_loader::load_default_nodes();
 
-        let mut config_constrained = OptimizerConfig::default();
-        config_constrained.game_phase = GamePhase::Phase1;
-        config_constrained.ignore_spawns = false;
+        let config_constrained = OptimizerConfig {
+            game_phase: GamePhase::Phase1,
+            ignore_spawns: false,
+            ..OptimizerConfig::default()
+        };
 
-        let mut config_ignored = OptimizerConfig::default();
-        config_ignored.game_phase = GamePhase::Phase1;
-        config_ignored.ignore_spawns = true;
+        let config_ignored = OptimizerConfig {
+            game_phase: GamePhase::Phase1,
+            ignore_spawns: true,
+            ..OptimizerConfig::default()
+        };
 
         let ctx = prepare_context(&nodes, &config_constrained);
         let far_dune_desert_x = 291000.0;

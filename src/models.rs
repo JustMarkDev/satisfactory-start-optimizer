@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -17,14 +19,19 @@ impl Purity {
             Purity::Pure => 2.0,
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl FromStr for Purity {
+    type Err = Infallible;
+
+    /// Unknown strings fall back to `Normal`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "RP_Inpure" | "RP_Impure" | "impure" => Purity::Impure,
             "RP_Normal" | "normal" => Purity::Normal,
             "RP_Pure" | "pure" => Purity::Pure,
             _ => Purity::Normal,
-        }
+        })
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,18 +63,22 @@ pub enum GamePhase {
     Phase5, // Tier 9 (Quantum End-game)
 }
 
-impl GamePhase {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for GamePhase {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "phase1" | "1" | "early" => Some(GamePhase::Phase1),
-            "phase2" | "2" | "steel" => Some(GamePhase::Phase2),
-            "phase3" | "3" | "oil" => Some(GamePhase::Phase3),
-            "phase4" | "4" | "late" | "nuclear" => Some(GamePhase::Phase4),
-            "phase5" | "5" | "quantum" | "end" => Some(GamePhase::Phase5),
-            _ => None,
+            "phase1" | "1" | "early" => Ok(GamePhase::Phase1),
+            "phase2" | "2" | "steel" => Ok(GamePhase::Phase2),
+            "phase3" | "3" | "oil" => Ok(GamePhase::Phase3),
+            "phase4" | "4" | "late" | "nuclear" => Ok(GamePhase::Phase4),
+            "phase5" | "5" | "quantum" | "end" => Ok(GamePhase::Phase5),
+            _ => Err(()),
         }
     }
+}
 
+impl GamePhase {
     #[allow(dead_code)]
     pub fn to_str(self) -> &'static str {
         match self {
@@ -325,7 +336,7 @@ pub fn preset_by_id_or_phase(input: &str) -> Option<&'static PresetDescriptor> {
     all_presets()
         .iter()
         .find(|preset| preset.id == input.as_str())
-        .or_else(|| GamePhase::from_str(&input).and_then(preset_by_phase))
+        .or_else(|| GamePhase::from_str(&input).ok().and_then(preset_by_phase))
 }
 
 pub fn preset_by_phase(phase: GamePhase) -> Option<&'static PresetDescriptor> {

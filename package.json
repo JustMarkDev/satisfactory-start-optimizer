@@ -10,17 +10,25 @@
     "server:raw": "cargo run -- --server 8080",
     "server:release": "cargo run --release -- --server 8080",
     "build": "vp build",
-    "check": "vp check",
-    "test": "bun test",
+    "check": "bun run check:js && bun run check:rust",
+    "check:js": "vp check",
+    "check:rust": "cargo fmt --check && bun run lint:rust",
+    "lint": "vp lint && bun run lint:rust",
+    "lint:rust": "cargo clippy --all-targets --locked -- -D warnings",
+    "format": "vp fmt && bun run format:rust",
+    "format:rust": "cargo fmt",
+    "test": "bun run test:js && bun run test:rust",
+    "test:js": "vp test run",
+    "test:rust": "cargo nextest run --locked",
     "bench": "cargo bench --bench optimizer",
-    "check:fix": "vp check --fix",
     "pack": "vp pack src/app.js --from-vite --out-dir dist/pack",
     "preview": "vp preview",
     "run": "vp run"
   },
   "devDependencies": {
-    "vite": "^8.3.1",
-    "vite-plus": "^0.3.3"
+    "vite-plus": "^1.0.0"
   },
-  "packageManager": "bun@1.3.14"
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.0.0"
+  }
 }

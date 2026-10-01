@@ -15,7 +15,7 @@ function spawnProcess(label, command, args) {
 
   children.push({ label, child });
 
-  (async () => {
+  void (async () => {
     const exitCode = await child.exited;
     if (!shuttingDown && exitCode !== 0) {
       console.error(`[dev] ${label} exited with code ${exitCode}. Shutting down...`);

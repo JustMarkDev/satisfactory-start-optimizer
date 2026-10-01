@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::str::FromStr;
 
 const EMBEDDED_NODES: &str = include_str!("../public/data/complete-map-data.json");
 
@@ -126,7 +127,8 @@ pub fn load_nodes_from_str(s: &str) -> Result<Vec<ResourceNode>, Box<dyn std::er
 
                                         let purity_str =
                                             marker.purity.as_deref().unwrap_or("RP_Normal");
-                                        let purity = Purity::from_str(purity_str);
+                                        let purity =
+                                            Purity::from_str(purity_str).unwrap_or(Purity::Normal);
 
                                         nodes.push(ResourceNode {
                                             resource_type: res_type.to_string(),

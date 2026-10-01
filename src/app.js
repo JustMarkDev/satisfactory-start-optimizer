@@ -874,7 +874,7 @@ function setupEvents() {
   });
 
   els.btnCompute.addEventListener("click", () => {
-    runGlobalOptimization();
+    void runGlobalOptimization();
   });
 
   // Layer Toggles removed. Nodes are always rendered.
@@ -1035,4 +1035,4 @@ async function init() {
 }
 
 // Run app init
-init();
+void init();

@@ -79,7 +79,7 @@ export function purityLabel(node) {
 }
 
 export function nonZeroWeights(weights) {
-  return Object.fromEntries(Object.entries(weights).filter(([_, value]) => value !== 0));
+  return Object.fromEntries(Object.entries(weights).filter(([, value]) => value !== 0));
 }
 
 export function hasOptimizationObjective(weights) {
