@@ -107,14 +107,25 @@ fn bench_game_phases(c: &mut Criterion) {
     group.sample_size(15);
     group.measurement_time(Duration::from_secs(25));
 
-    for preset_id in ["phase1", "phase2", "phase3", "phase4", "phase5", "collectibles"] {
+    for preset_id in [
+        "phase1",
+        "phase2",
+        "phase3",
+        "phase4",
+        "phase5",
+        "collectibles",
+    ] {
         let config = phase_config(preset_id, SearchStrategy::Hybrid);
-        group.bench_with_input(BenchmarkId::from_parameter(preset_id), &config, |b, config| {
-            b.iter(|| {
-                let results = optimizer::optimize(black_box(&nodes), black_box(config));
-                black_box(results[0].score)
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(preset_id),
+            &config,
+            |b, config| {
+                b.iter(|| {
+                    let results = optimizer::optimize(black_box(&nodes), black_box(config));
+                    black_box(results[0].score)
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -127,24 +138,29 @@ fn bench_thread_scaling(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(30));
 
     for threads in [1usize, 2, 4, 8] {
-        group.bench_with_input(BenchmarkId::new("hybrid_phase1", threads), &threads, |b, &n| {
-            b.iter_custom(|iters| {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .build()
-                    .expect("rayon pool");
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    let start = std::time::Instant::now();
-                    pool.install(|| {
-                        let results = optimizer::optimize(black_box(&nodes), black_box(&config));
-                        black_box(results[0].score);
-                    });
-                    total += start.elapsed();
-                }
-                total
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("hybrid_phase1", threads),
+            &threads,
+            |b, &n| {
+                b.iter_custom(|iters| {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(n)
+                        .build()
+                        .expect("rayon pool");
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let start = std::time::Instant::now();
+                        pool.install(|| {
+                            let results =
+                                optimizer::optimize(black_box(&nodes), black_box(&config));
+                            black_box(results[0].score);
+                        });
+                        total += start.elapsed();
+                    }
+                    total
+                });
+            },
+        );
     }
     group.finish();
 }

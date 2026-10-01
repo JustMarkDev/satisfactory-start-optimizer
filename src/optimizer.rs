@@ -328,11 +328,7 @@ impl LandAccel {
             return None;
         }
         let d = self.border_dist_cm[r as usize * self.cols + c as usize];
-        if d < 0.0 {
-            None
-        } else {
-            Some(d as f64)
-        }
+        if d < 0.0 { None } else { Some(d as f64) }
     }
 }
 
@@ -906,7 +902,12 @@ impl SearchContext {
         )
     }
 
-    fn refine_from(&self, start_x: f64, start_y: f64, config: &OptimizerConfig) -> OptimizationResult {
+    fn refine_from(
+        &self,
+        start_x: f64,
+        start_y: f64,
+        config: &OptimizerConfig,
+    ) -> OptimizationResult {
         run_hill_climbing(
             start_x,
             start_y,
@@ -1157,8 +1158,7 @@ fn grid_search_refine(
         .into_par_iter()
         .map(|(x, y, _)| (x, y, ctx.utility(x, y, config, EvalQuality::Fine)))
         .collect();
-    let start_candidates =
-        pick_diverse_maxima(reranked, min_dist_between_starts, max_candidates);
+    let start_candidates = pick_diverse_maxima(reranked, min_dist_between_starts, max_candidates);
 
     // Stage 2: local fine grid around each coarse peak, then gradient ascent.
     let fine_step_x = step_x / (fine_half_window as f64 + 1.0);
