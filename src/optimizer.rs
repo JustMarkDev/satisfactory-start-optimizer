@@ -261,9 +261,119 @@ const LAND_MASK_SECTORS: usize = 128;
 const LAND_MASK_BUFFER_CM: f64 = 22_000.0; // ≈ 30 map pixels / 220 m.
 const MAP_PIXEL_TO_CM: f64 = 1.0 / 0.0013653321;
 
+const BORDER_MARGIN_CM: f64 = 30_000.0; // 300 m
+const LAND_ACCEL_RES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalQuality {
+    /// Grid screening: land bitmap + distance field, 2D yields only (no KNN altitude).
+    Coarse,
+    /// Final scoring: exact border near edges, full 3D altitude + flatness.
+    Fine,
+}
+
 #[derive(Debug, Clone)]
 struct LandMask {
     points: Vec<(f64, f64)>,
+}
+
+/// Precomputed land membership + border distance for O(1) grid rejects.
+#[derive(Debug, Clone)]
+struct LandAccel {
+    cols: usize,
+    rows: usize,
+    cell_w: f64,
+    cell_h: f64,
+    /// Negative => outside land. Otherwise distance to polygon edge in cm.
+    border_dist_cm: Vec<f32>,
+}
+
+impl LandAccel {
+    fn from_mask(mask: &LandMask) -> Self {
+        let cols = LAND_ACCEL_RES;
+        let rows = LAND_ACCEL_RES;
+        let cell_w = (MAX_X - MIN_X) / cols as f64;
+        let cell_h = (MAX_Y - MIN_Y) / rows as f64;
+        let points = mask.points.clone();
+
+        let border_dist_cm: Vec<f32> = (0..rows * cols)
+            .into_par_iter()
+            .map(|idx| {
+                let c = idx % cols;
+                let r = idx / cols;
+                let x = MIN_X + (c as f64 + 0.5) * cell_w;
+                let y = MIN_Y + (r as f64 + 0.5) * cell_h;
+                if is_in_polygon(x, y, &points) {
+                    dist_to_polygon_edge(x, y, &points) as f32
+                } else {
+                    -1.0
+                }
+            })
+            .collect();
+
+        Self {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+            border_dist_cm,
+        }
+    }
+
+    #[inline]
+    fn sample(&self, x: f64, y: f64) -> Option<f64> {
+        let c = ((x - MIN_X) / self.cell_w).floor() as isize;
+        let r = ((y - MIN_Y) / self.cell_h).floor() as isize;
+        if c < 0 || r < 0 || c >= self.cols as isize || r >= self.rows as isize {
+            return None;
+        }
+        let d = self.border_dist_cm[r as usize * self.cols + c as usize];
+        if d < 0.0 {
+            None
+        } else {
+            Some(d as f64)
+        }
+    }
+}
+
+#[inline]
+fn border_penalty_from_dist(border_dist_cm: f64) -> f64 {
+    if border_dist_cm < BORDER_MARGIN_CM {
+        (-4.0 * (1.0 - border_dist_cm / BORDER_MARGIN_CM)).exp()
+    } else {
+        1.0
+    }
+}
+
+/// Returns border penalty, or None when the point is outside buildable land.
+fn land_border_penalty(
+    x: f64,
+    y: f64,
+    land_mask: &LandMask,
+    land_accel: &LandAccel,
+    quality: EvalQuality,
+) -> Option<f64> {
+    match land_accel.sample(x, y) {
+        None => {
+            if quality == EvalQuality::Coarse || !is_in_polygon(x, y, &land_mask.points) {
+                None
+            } else {
+                let d = dist_to_polygon_edge(x, y, &land_mask.points);
+                let p = border_penalty_from_dist(d);
+                if p < 0.01 { None } else { Some(p) }
+            }
+        }
+        Some(field_dist) if field_dist >= BORDER_MARGIN_CM => Some(1.0),
+        Some(field_dist) => {
+            let d = if quality == EvalQuality::Coarse {
+                field_dist
+            } else {
+                dist_to_polygon_edge(x, y, &land_mask.points)
+            };
+            let p = border_penalty_from_dist(d);
+            if p < 0.01 { None } else { Some(p) }
+        }
+    }
 }
 
 impl LandMask {
@@ -397,8 +507,7 @@ fn dist_to_polygon_edge(x: f64, y: f64, vs: &[(f64, f64)]) -> f64 {
     min_dist
 }
 
-/// Calculates the dynamic multi-resource Cobb-Douglas utility function at a coordinate (x, y)
-/// using spatial grid bucketing, KNN elevation, terrain flatness, water proximity, and radiation.
+/// Calculates the dynamic multi-resource utility at (x, y).
 fn calculate_utility(
     x: f64,
     y: f64,
@@ -411,27 +520,13 @@ fn calculate_utility(
     res_to_idx: &HashMap<String, usize>,
     waterwell_nodes: &[(f64, f64)],
     land_mask: &LandMask,
+    land_accel: &LandAccel,
+    quality: EvalQuality,
 ) -> f64 {
-    // Reject points outside the practical landmass polygon.
-    if !is_in_polygon(x, y, &land_mask.points) {
-        return 0.0;
-    }
-
-    // Border margin penalty: apply a soft penalty within 300 m of the polygon edge
-    // to prevent the optimizer locking onto border corners where the Cobb-Douglas
-    // epsilon floor creates false local maxima. 300 m is enough to push away from
-    // the actual polygon boundary while not affecting real interior areas (all
-    // starting zones are at least 1.2 km from the nearest polygon edge).
-    const BORDER_MARGIN_CM: f64 = 30_000.0; // 300 m
-    let border_dist = dist_to_polygon_edge(x, y, &land_mask.points);
-    let border_penalty = if border_dist < BORDER_MARGIN_CM {
-        (-4.0 * (1.0 - border_dist / BORDER_MARGIN_CM)).exp()
-    } else {
-        1.0
+    let border_penalty = match land_border_penalty(x, y, land_mask, land_accel, quality) {
+        Some(p) => p,
+        None => return 0.0,
     };
-    if border_penalty < 0.01 {
-        return 0.0;
-    }
 
     let radius = 3.5 * config.sigma;
     let radius_cm = radius * 100.0;
@@ -451,16 +546,18 @@ fn calculate_utility(
     let row_end = (((max_qy - spatial_grid.min_y) / spatial_grid.bucket_size) as isize)
         .clamp(0, spatial_grid.rows as isize - 1) as usize;
 
-    // 1. KNN IDW Ground Height Estimation
-    let z = estimate_altitude(x, y, opt_nodes, spatial_grid, config.sigma);
+    let use_altitude = quality == EvalQuality::Fine;
+    let z = if use_altitude {
+        estimate_altitude(x, y, opt_nodes, spatial_grid, config.sigma)
+    } else {
+        0.0
+    };
 
-    // 2. Sum yields for all resource types & collect local heights for terrain flatness
     let mut yields = [0.0; 128];
 
-    let build_radius = 1.5 * config.sigma; // factory building area footprint
+    let build_radius = 1.5 * config.sigma;
     let build_radius_m_sq = build_radius * build_radius;
 
-    // Welford's algorithm variables for online variance calculation
     let mut heights_count = 0;
     let mut heights_mean = 0.0;
     let mut heights_m2 = 0.0;
@@ -472,11 +569,14 @@ fn calculate_utility(
                 let node = &opt_nodes[node_idx];
                 let dx = (x - node.x) / 100.0;
                 let dy = (y - node.y) / 100.0;
-                let dz = (z - node.z) / 100.0;
 
-                let vertical_multiplier = 4.0;
-                let d_sq =
-                    dx * dx + dy * dy + (dz * dz * vertical_multiplier * vertical_multiplier);
+                let d_sq = if use_altitude {
+                    let dz = (z - node.z) / 100.0;
+                    let vertical_multiplier = 4.0;
+                    dx * dx + dy * dy + (dz * dz * vertical_multiplier * vertical_multiplier)
+                } else {
+                    dx * dx + dy * dy
+                };
 
                 if d_sq <= radius_m_sq {
                     let d = d_sq.sqrt();
@@ -484,8 +584,7 @@ fn calculate_utility(
                     let contribution = node_yield_contribution(node, decay, config.game_phase);
                     yields[node.res_idx] += contribution;
 
-                    // Keep track of nearby heights using Welford's algorithm
-                    if d_sq <= build_radius_m_sq {
+                    if use_altitude && d_sq <= build_radius_m_sq {
                         heights_count += 1;
                         let delta = node.z - heights_mean;
                         heights_mean += delta / heights_count as f64;
@@ -497,34 +596,23 @@ fn calculate_utility(
         }
     }
 
-    // Add virtual water yield based on proximity to mapped lakes/ponds or waterwells.
     if let Some(&water_idx) = res_to_idx.get("water") {
         yields[water_idx] = virtual_water_yield(x, y, waterwell_nodes, config);
     }
 
-    // 3. Terrain Flatness Penalty (Population std dev of local node heights)
-    // Scale denominator of 20m: a 20m std dev halves the score (e⁻¹ ≈ 36.8%).
-    // Using 20 instead of 40 ensures mountainous terrain (e.g. Northern Forest,
-    // ~50-150m std dev) is meaningfully penalised vs. flat biomes (Grass Fields ~5-15m).
     let mut flatness_mult = 1.0;
-    if heights_count > 1 {
+    if use_altitude && heights_count > 1 {
         let std_dev_cm = (heights_m2 / heights_count as f64).sqrt();
         let std_dev_m = std_dev_cm / 100.0;
         flatness_mult = (-std_dev_m / 30.0).exp();
     }
 
-    // Gravity / Clustering Bonus: Increase yield non-linearly if multiple nodes are nearby
     for i in 0..num_resources {
         if yields[i] > 1.0 {
             yields[i] *= 1.0 + 0.1 * (yields[i] - 1.0);
         }
     }
 
-    // 4. Combined Utility + Radiation/Threat Penalties
-    //
-    // Cobb-Douglas: normalise exponents to sum to 1.0 to enforce constant returns to scale.
-    // Without normalisation, adding more resources inflates scores non-linearly, making
-    // cross-phase comparisons meaningless (Phase 4 with 14 active weights >> Phase 1 with 4).
     let mut score = match config.utility_func {
         crate::models::UtilityFunction::CobbDouglas => {
             let weight_sum: f64 = weights_arr[..num_resources]
@@ -538,7 +626,6 @@ fn calculate_utility(
                 if weight > 0.0 {
                     let res_yield = yields[i];
                     let eps = epsilons_arr[i];
-                    // Normalised exponent: weight_i / Σ(positive_weights)
                     s *= (res_yield + eps).powf(weight / norm);
                 }
             }
@@ -573,7 +660,6 @@ fn calculate_utility(
         }
     };
 
-    // Apply threat penalties (negative weights)
     for i in 0..num_resources {
         let weight = weights_arr[i];
         if weight < 0.0 {
@@ -583,16 +669,6 @@ fn calculate_utility(
         }
     }
 
-    // Phase-scaled spawn proximity penalty.
-    // Early-game players cannot travel far from their drop pod on foot. This penalty
-    // prevents the optimizer from recommending a remote "ideal" base location that
-    // requires a vehicle to reach from spawn — which the player won't have in Phase 1.
-    //
-    // tolerance_m: the 1/e distance at which spawn distance is penalised 63%.
-    //   Phase 1: 800 m  — strict (foot travel only)
-    //   Phase 2: 1500 m — lenient (player likely has a vehicle)
-    //   Phase 3: 3000 m — relaxed (trains/trucks operational)
-    //   Phase 4+: no penalty (helicopters, transport network established)
     let spawn_tolerance_m: Option<f64> = if config.ignore_spawns {
         None
     } else {
@@ -615,7 +691,6 @@ fn calculate_utility(
                 min_spawn_dist_m = boundary_dist;
             }
         }
-        // Soft penalty: exp(-dist/tolerance). At dist=0 → 1.0; at dist=tol → e⁻¹ ≈ 0.37
         let spawn_penalty = (-min_spawn_dist_m / tol).exp();
         score *= spawn_penalty;
     }
@@ -623,7 +698,7 @@ fn calculate_utility(
     score * flatness_mult * border_penalty
 }
 
-/// Helper that runs hill climbing starting from a given coordinate (start_x, start_y)
+/// Finite-difference gradient ascent, then assemble the result payload.
 fn run_hill_climbing(
     start_x: f64,
     start_y: f64,
@@ -636,73 +711,48 @@ fn run_hill_climbing(
     res_to_idx: &HashMap<String, usize>,
     waterwell_nodes: &[(f64, f64)],
     land_mask: &LandMask,
+    land_accel: &LandAccel,
 ) -> OptimizationResult {
+    let util = |x: f64, y: f64| {
+        calculate_utility(
+            x,
+            y,
+            opt_nodes,
+            spatial_grid,
+            config,
+            num_resources,
+            weights_arr,
+            epsilons_arr,
+            res_to_idx,
+            waterwell_nodes,
+            land_mask,
+            land_accel,
+            EvalQuality::Fine,
+        )
+    };
+
     let mut curr_x = start_x;
     let mut curr_y = start_y;
-
-    let mut step = 10000.0;
+    let mut step: f64 = 10000.0;
     let tolerance = 10.0;
-
-    let mut max_score = calculate_utility(
-        curr_x,
-        curr_y,
-        opt_nodes,
-        spatial_grid,
-        config,
-        num_resources,
-        weights_arr,
-        epsilons_arr,
-        res_to_idx,
-        waterwell_nodes,
-        land_mask,
-    );
-
-    let dirs = [
-        (1.0, 0.0),
-        (-1.0, 0.0),
-        (0.0, 1.0),
-        (0.0, -1.0),
-        (0.7071, 0.7071),
-        (-0.7071, 0.7071),
-        (0.7071, -0.7071),
-        (-0.7071, -0.7071),
-    ];
+    let mut max_score = util(curr_x, curr_y);
 
     while step > tolerance {
-        let mut best_neighbor_score = max_score;
-        let mut next_x = curr_x;
-        let mut next_y = curr_y;
-
-        for &(dx, dy) in &dirs {
-            let tx = curr_x + dx * step;
-            let ty = curr_y + dy * step;
-
-            if tx < MIN_X || tx > MAX_X || ty < MIN_Y || ty > MAX_Y {
-                continue;
-            }
-
-            let score = calculate_utility(
-                tx,
-                ty,
-                opt_nodes,
-                spatial_grid,
-                config,
-                num_resources,
-                weights_arr,
-                epsilons_arr,
-                res_to_idx,
-                waterwell_nodes,
-                land_mask,
-            );
-            if score > best_neighbor_score {
-                best_neighbor_score = score;
-                next_x = tx;
-                next_y = ty;
-            }
+        let h = step.max(50.0);
+        let gx = (util(curr_x + h, curr_y) - util(curr_x - h, curr_y)) / (2.0 * h);
+        let gy = (util(curr_x, curr_y + h) - util(curr_x, curr_y - h)) / (2.0 * h);
+        let gnorm = (gx * gx + gy * gy).sqrt();
+        if gnorm < 1e-15 {
+            step *= 0.5;
+            continue;
         }
 
-        if best_neighbor_score > max_score {
-            max_score = best_neighbor_score;
+        let next_x = (curr_x + step * gx / gnorm).clamp(MIN_X, MAX_X);
+        let next_y = (curr_y + step * gy / gnorm).clamp(MIN_Y, MAX_Y);
+        let next_score = util(next_x, next_y);
+
+        if next_score > max_score {
+            max_score = next_score;
             curr_x = next_x;
             curr_y = next_y;
         } else {
@@ -710,10 +760,8 @@ fn run_hill_climbing(
         }
     }
 
-    // Re-estimate final base altitude Z using KNN IDW
     let final_z = estimate_altitude(curr_x, curr_y, opt_nodes, spatial_grid, config.sigma);
 
-    // Find closest starting spawn point
     let mut closest_spawn = DEFAULT_SPAWNS[0].clone();
     let mut min_dist = f64::MAX;
 
@@ -727,7 +775,6 @@ fn run_hill_climbing(
         }
     }
 
-    // Build inverse resource map for display names
     let mut inv_res_map: HashMap<usize, String> = HashMap::new();
     for (k, v) in res_to_idx {
         inv_res_map.insert(*v, k.clone());
@@ -737,15 +784,11 @@ fn run_hill_climbing(
 
     let mut local_nodes: HashMap<String, u32> = HashMap::new();
     let mut obstructed_nodes: HashMap<String, u32> = HashMap::new();
-
-    // Per-resource weighted yield totals (for output display)
     let mut resource_yields: HashMap<String, f64> = HashMap::new();
 
-    // Terrain Ruggedness Index: collect Z values of all nodes within sigma for TRI
-    // TRI = mean(|Z_neighbour - Z_centre|) over nearby nodes
     let mut tri_sum = 0.0;
     let mut tri_count = 0usize;
-    let tri_radius_sq = (config.sigma * 0.5 * 100.0) * (config.sigma * 0.5 * 100.0); // 0.5σ neighbourhood
+    let tri_radius_sq = (config.sigma * 0.5 * 100.0) * (config.sigma * 0.5 * 100.0);
 
     for node in opt_nodes {
         let dx = curr_x - node.x;
@@ -754,7 +797,6 @@ fn run_hill_climbing(
         let d_sq_3d = dx * dx + dy * dy + (dz * dz * 16.0);
         let d_sq_2d = dx * dx + dy * dy;
 
-        // Node inventory within sigma radius
         if d_sq_3d <= search_radius_sq {
             if let Some(name) = inv_res_map.get(&node.res_idx) {
                 let purity_str = if node.multiplier > 1.5 {
@@ -766,7 +808,6 @@ fn run_hill_climbing(
                 };
                 let display_name = format!("{} {}", purity_str, name);
 
-                // Separate accessible vs obstructed nodes
                 if node.obstructed
                     && (config.game_phase == crate::models::GamePhase::Phase1
                         || config.game_phase == crate::models::GamePhase::Phase2)
@@ -776,7 +817,6 @@ fn run_hill_climbing(
                     *local_nodes.entry(display_name).or_insert(0) += 1;
                 }
 
-                // Accumulate decay-weighted yield for this resource type
                 let d_m = d_sq_3d.sqrt() / 100.0;
                 let decay = decay_weight(d_m, d_m * d_m, config.sigma, config.decay_func);
                 let contribution = node_yield_contribution(node, decay, config.game_phase);
@@ -786,9 +826,8 @@ fn run_hill_climbing(
             }
         }
 
-        // TRI: use 2D distance only (no vertical penalty) for a fair ruggedness measure
         if d_sq_2d <= tri_radius_sq {
-            tri_sum += ((final_z - node.z) / 100.0).abs(); // convert cm → m
+            tri_sum += ((final_z - node.z) / 100.0).abs();
             tri_count += 1;
         }
     }
@@ -806,8 +845,6 @@ fn run_hill_climbing(
         0.0
     };
 
-    // Shannon entropy diversity of resource yields (higher = more balanced access)
-    // diversity = -Σ p_i * ln(p_i)  where p_i = yield_i / total_yield
     let total_yield: f64 = resource_yields.values().sum();
     let diversity_score = if total_yield > 0.0 {
         resource_yields
@@ -837,8 +874,7 @@ fn run_hill_climbing(
     }
 }
 
-/// Runs a global high-resolution grid search to find candidate basins, identifies
-/// all local maxima, then runs parallelized hill climbing on the top 50 candidates.
+/// Runs a coarse→fine grid search, then parallelized gradient ascent on top candidates.
 struct SearchContext {
     opt_nodes: Vec<OptNode>,
     spatial_grid: SpatialGrid,
@@ -848,6 +884,50 @@ struct SearchContext {
     res_to_idx: HashMap<String, usize>,
     waterwell_nodes: Vec<(f64, f64)>,
     land_mask: LandMask,
+    land_accel: LandAccel,
+}
+
+impl SearchContext {
+    fn utility(&self, x: f64, y: f64, config: &OptimizerConfig, quality: EvalQuality) -> f64 {
+        calculate_utility(
+            x,
+            y,
+            &self.opt_nodes,
+            &self.spatial_grid,
+            config,
+            self.num_resources,
+            &self.weights_arr,
+            &self.epsilons_arr,
+            &self.res_to_idx,
+            &self.waterwell_nodes,
+            &self.land_mask,
+            &self.land_accel,
+            quality,
+        )
+    }
+
+    fn refine_from(&self, start_x: f64, start_y: f64, config: &OptimizerConfig) -> OptimizationResult {
+        run_hill_climbing(
+            start_x,
+            start_y,
+            &self.opt_nodes,
+            &self.spatial_grid,
+            config,
+            self.num_resources,
+            &self.weights_arr,
+            &self.epsilons_arr,
+            &self.res_to_idx,
+            &self.waterwell_nodes,
+            &self.land_mask,
+            &self.land_accel,
+        )
+    }
+}
+
+fn spatial_bucket_size_cm(sigma: f64) -> f64 {
+    // Match bucket size to the typical query radius (3.5σ), clamped so tiny σ
+    // doesn't explode the bucket table and huge σ doesn't go back to 1 km.
+    (sigma * 3.5 * 100.0).clamp(20_000.0, 80_000.0)
 }
 
 fn prepare_context(nodes: &[ResourceNode], config: &OptimizerConfig) -> SearchContext {
@@ -879,10 +959,6 @@ fn prepare_context(nodes: &[ResourceNode], config: &OptimizerConfig) -> SearchCo
         }
     }
 
-    // Epsilon floors: keep small but non-zero for Cobb-Douglas/Linear to avoid log(0).
-    // For Leontief, epsilon must be near-zero — otherwise the score floor
-    // (eps/weight) is large enough that degenerate map-boundary plateaus
-    // (where no real nodes exist) yield non-negligible scores that pollute results.
     let leontief_eps = matches!(
         config.utility_func,
         crate::models::UtilityFunction::Leontief
@@ -890,7 +966,7 @@ fn prepare_context(nodes: &[ResourceNode], config: &OptimizerConfig) -> SearchCo
     let mut epsilons_arr = vec![if leontief_eps { 0.001 } else { 0.1 }; num_resources];
     for (i, t) in unique_types.iter().enumerate() {
         epsilons_arr[i] = if leontief_eps {
-            0.001 // uniformly tiny for Leontief
+            0.001
         } else {
             match t.as_str() {
                 "iron" | "copper" | "limestone" => 0.005,
@@ -911,17 +987,13 @@ fn prepare_context(nodes: &[ResourceNode], config: &OptimizerConfig) -> SearchCo
             };
             let mut obstructed = n.obstructed;
 
-            // --- TEMPORARY HEURISTIC FOR UN-SAVED DEFAULT DATABASE OBSTRUCTIONS ---
-            // To easily remove this later, just delete this block and set `obstructed = n.obstructed`.
             if !obstructed && n.resource_type == "caterium" {
-                // Keep only the starting Rocky Desert Caterium node open (near x = -2200m, y = -1500m)
                 let is_starting_caterium =
                     (n.x - (-220000.0)).abs() < 50000.0 && (n.y - (-150000.0)).abs() < 50000.0;
                 if !is_starting_caterium {
                     obstructed = true;
                 }
             }
-            // ----------------------------------------------------------------------
 
             OptNode {
                 x: n.x,
@@ -934,7 +1006,7 @@ fn prepare_context(nodes: &[ResourceNode], config: &OptimizerConfig) -> SearchCo
         })
         .collect();
 
-    let spatial_grid = SpatialGrid::new(&opt_nodes, 100000.0);
+    let spatial_grid = SpatialGrid::new(&opt_nodes, spatial_bucket_size_cm(config.sigma));
     let waterwell_idx = res_to_idx.get("waterwell").copied();
     let waterwell_nodes = waterwell_idx
         .map(|idx| {
@@ -946,6 +1018,7 @@ fn prepare_context(nodes: &[ResourceNode], config: &OptimizerConfig) -> SearchCo
         })
         .unwrap_or_default();
     let land_mask = LandMask::from_nodes(&opt_nodes);
+    let land_accel = LandAccel::from_mask(&land_mask);
 
     SearchContext {
         opt_nodes,
@@ -956,102 +1029,25 @@ fn prepare_context(nodes: &[ResourceNode], config: &OptimizerConfig) -> SearchCo
         res_to_idx,
         waterwell_nodes,
         land_mask,
+        land_accel,
     }
 }
 
-fn grid_search_refine(
-    ctx: &SearchContext,
-    config: &OptimizerConfig,
-    grid_res: usize,
+fn pick_diverse_maxima(
+    local_maxima: Vec<(f64, f64, f64)>,
     min_dist_between_starts: f64,
     max_candidates: usize,
-) -> Vec<OptimizationResult> {
-    let step_x = (MAX_X - MIN_X) / grid_res as f64;
-    let step_y = (MAX_Y - MIN_Y) / grid_res as f64;
-
-    let grid_points: Vec<(f64, f64)> = (0..=grid_res)
-        .flat_map(|row| {
-            let y = MIN_Y + row as f64 * step_y;
-            (0..=grid_res).map(move |col| {
-                let x = MIN_X + col as f64 * step_x;
-                (x, y)
-            })
-        })
-        .collect();
-
-    let scores: Vec<f64> = grid_points
-        .into_par_iter()
-        .map(|(x, y)| {
-            calculate_utility(
-                x,
-                y,
-                &ctx.opt_nodes,
-                &ctx.spatial_grid,
-                config,
-                ctx.num_resources,
-                &ctx.weights_arr,
-                &ctx.epsilons_arr,
-                &ctx.res_to_idx,
-                &ctx.waterwell_nodes,
-                &ctx.land_mask,
-            )
-        })
-        .collect();
-
-    let rows = grid_res + 1;
-    let cols = grid_res + 1;
-
-    let mut local_maxima = Vec::new();
-    for r in 0..rows {
-        for c in 0..cols {
-            let idx = r * cols + c;
-            let score = scores[idx];
-
-            if score <= 1e-5 {
-                continue;
-            }
-
-            let mut is_local_max = true;
-            for dr in -1..=1 {
-                for dc in -1..=1 {
-                    if dr == 0 && dc == 0 {
-                        continue;
-                    }
-                    let nr = r as isize + dr;
-                    let nc = c as isize + dc;
-                    if nr >= 0 && nr < rows as isize && nc >= 0 && nc < cols as isize {
-                        let n_idx = (nr as usize) * cols + (nc as usize);
-                        if scores[n_idx] > score {
-                            is_local_max = false;
-                            break;
-                        }
-                    }
-                }
-                if !is_local_max {
-                    break;
-                }
-            }
-
-            if is_local_max {
-                let x = MIN_X + c as f64 * step_x;
-                let y = MIN_Y + r as f64 * step_y;
-                local_maxima.push((x, y, score));
-            }
-        }
-    }
-
+) -> Vec<(f64, f64, f64)> {
     let mut sorted_maxima = local_maxima;
     sorted_maxima.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut start_candidates: Vec<(f64, f64, f64)> = Vec::new();
-
     for (x, y, score) in sorted_maxima {
         let is_far_enough = start_candidates.iter().all(|&(cx, cy, _)| {
             let dx = cx - x;
             let dy = cy - y;
             (dx * dx + dy * dy).sqrt() >= min_dist_between_starts
         });
-
         if is_far_enough {
             start_candidates.push((x, y, score));
             if start_candidates.len() >= max_candidates {
@@ -1065,27 +1061,137 @@ fn grid_search_refine(
             start_candidates.push((spawn.x, spawn.y, 0.0));
         }
     }
+    start_candidates
+}
 
-    let refined_results: Vec<OptimizationResult> = start_candidates
-        .into_par_iter()
-        .map(|(start_x, start_y, _)| {
-            run_hill_climbing(
-                start_x,
-                start_y,
-                &ctx.opt_nodes,
-                &ctx.spatial_grid,
-                config,
-                ctx.num_resources,
-                &ctx.weights_arr,
-                &ctx.epsilons_arr,
-                &ctx.res_to_idx,
-                &ctx.waterwell_nodes,
-                &ctx.land_mask,
-            )
+fn grid_search_refine(
+    ctx: &SearchContext,
+    config: &OptimizerConfig,
+    coarse_res: usize,
+    fine_half_window: isize,
+    min_dist_between_starts: f64,
+    max_candidates: usize,
+) -> Vec<OptimizationResult> {
+    let step_x = (MAX_X - MIN_X) / coarse_res as f64;
+    let step_y = (MAX_Y - MIN_Y) / coarse_res as f64;
+
+    let grid_points: Vec<(f64, f64)> = (0..=coarse_res)
+        .flat_map(|row| {
+            let y = MIN_Y + row as f64 * step_y;
+            (0..=coarse_res).map(move |col| {
+                let x = MIN_X + col as f64 * step_x;
+                (x, y)
+            })
         })
         .collect();
 
-    top_n_results(refined_results, 3, 150_000.0 / 100.0) // 1.5 km min separation
+    // Stage 1: coarse screening (no altitude, land accel).
+    let scores: Vec<f64> = grid_points
+        .into_par_iter()
+        .map(|(x, y)| ctx.utility(x, y, config, EvalQuality::Coarse))
+        .collect();
+
+    let rows = coarse_res + 1;
+    let cols = coarse_res + 1;
+
+    let mut local_maxima = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c;
+            let score = scores[idx];
+            if score <= 1e-5 {
+                continue;
+            }
+
+            let mut is_local_max = true;
+            'neighbors: for dr in -1..=1 {
+                for dc in -1..=1 {
+                    if dr == 0 && dc == 0 {
+                        continue;
+                    }
+                    let nr = r as isize + dr;
+                    let nc = c as isize + dc;
+                    if nr >= 0 && nr < rows as isize && nc >= 0 && nc < cols as isize {
+                        let n_idx = (nr as usize) * cols + (nc as usize);
+                        if scores[n_idx] > score {
+                            is_local_max = false;
+                            break 'neighbors;
+                        }
+                    }
+                }
+            }
+
+            if is_local_max {
+                let x = MIN_X + c as f64 * step_x;
+                let y = MIN_Y + r as f64 * step_y;
+                local_maxima.push((x, y, score));
+            }
+        }
+    }
+
+    // Coarse local maxima → Fine re-score a wider pool → diversify.
+    // Coarse 2D ranking can prefer a different basin than full Fine utility.
+    let mut coarse_tops = local_maxima;
+    coarse_tops.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    coarse_tops.truncate(max_candidates * 4);
+
+    // Always include spawn + sparse multi-starts so coarse screening cannot
+    // drop the basins Fast mode already reaches.
+    for spawn in DEFAULT_SPAWNS {
+        coarse_tops.push((spawn.x, spawn.y, 0.0));
+    }
+    let boost_steps = 4;
+    let boost_sx = (MAX_X - MIN_X) / (boost_steps + 1) as f64;
+    let boost_sy = (MAX_Y - MIN_Y) / (boost_steps + 1) as f64;
+    for i in 1..=boost_steps {
+        for j in 1..=boost_steps {
+            coarse_tops.push((
+                MIN_X + i as f64 * boost_sx,
+                MIN_Y + j as f64 * boost_sy,
+                0.0,
+            ));
+        }
+    }
+
+    let reranked: Vec<(f64, f64, f64)> = coarse_tops
+        .into_par_iter()
+        .map(|(x, y, _)| (x, y, ctx.utility(x, y, config, EvalQuality::Fine)))
+        .collect();
+    let start_candidates =
+        pick_diverse_maxima(reranked, min_dist_between_starts, max_candidates);
+
+    // Stage 2: local fine grid around each coarse peak, then gradient ascent.
+    let fine_step_x = step_x / (fine_half_window as f64 + 1.0);
+    let fine_step_y = step_y / (fine_half_window as f64 + 1.0);
+
+    let refined_results: Vec<OptimizationResult> = start_candidates
+        .into_par_iter()
+        .map(|(cx, cy, _)| {
+            let mut best_x = cx;
+            let mut best_y = cy;
+            let mut best_score = ctx.utility(cx, cy, config, EvalQuality::Fine);
+
+            for di in -fine_half_window..=fine_half_window {
+                for dj in -fine_half_window..=fine_half_window {
+                    if di == 0 && dj == 0 {
+                        continue;
+                    }
+                    let fx = (cx + di as f64 * fine_step_x).clamp(MIN_X, MAX_X);
+                    let fy = (cy + dj as f64 * fine_step_y).clamp(MIN_Y, MAX_Y);
+                    let s = ctx.utility(fx, fy, config, EvalQuality::Fine);
+                    if s > best_score {
+                        best_score = s;
+                        best_x = fx;
+                        best_y = fy;
+                    }
+                }
+            }
+
+            ctx.refine_from(best_x, best_y, config)
+        })
+        .collect();
+
+    top_n_results(refined_results, 3, 150_000.0 / 100.0)
 }
 
 /// Returns the top N unique results from a set of refined candidates,
@@ -1142,29 +1248,12 @@ fn top_n_results(
 }
 
 fn optimize_hybrid(ctx: &SearchContext, config: &OptimizerConfig) -> Vec<OptimizationResult> {
-    let grid_res = 500;
-    let min_dist_between_starts = 300.0 * 100.0;
-    let max_candidates = 50;
-    grid_search_refine(
-        ctx,
-        config,
-        grid_res,
-        min_dist_between_starts,
-        max_candidates,
-    )
+    // Coarse 150² screen + local fine window ≈ old 500² work with far fewer evals.
+    grid_search_refine(ctx, config, 150, 5, 300.0 * 100.0, 50)
 }
 
 fn optimize_slow(ctx: &SearchContext, config: &OptimizerConfig) -> Vec<OptimizationResult> {
-    let grid_res = 1000;
-    let min_dist_between_starts = 200.0 * 100.0;
-    let max_candidates = 100;
-    grid_search_refine(
-        ctx,
-        config,
-        grid_res,
-        min_dist_between_starts,
-        max_candidates,
-    )
+    grid_search_refine(ctx, config, 250, 6, 200.0 * 100.0, 100)
 }
 
 fn optimize_fast(ctx: &SearchContext, config: &OptimizerConfig) -> Vec<OptimizationResult> {
@@ -1187,21 +1276,7 @@ fn optimize_fast(ctx: &SearchContext, config: &OptimizerConfig) -> Vec<Optimizat
 
     let refined_results: Vec<OptimizationResult> = starts
         .into_par_iter()
-        .map(|(start_x, start_y)| {
-            run_hill_climbing(
-                start_x,
-                start_y,
-                &ctx.opt_nodes,
-                &ctx.spatial_grid,
-                config,
-                ctx.num_resources,
-                &ctx.weights_arr,
-                &ctx.epsilons_arr,
-                &ctx.res_to_idx,
-                &ctx.waterwell_nodes,
-                &ctx.land_mask,
-            )
-        })
+        .map(|(start_x, start_y)| ctx.refine_from(start_x, start_y, config))
         .collect();
 
     top_n_results(refined_results, 3, 150_000.0 / 100.0)
@@ -1283,31 +1358,17 @@ mod tests {
         let far_dune_desert_x = 291000.0;
         let far_dune_desert_y = 74000.0;
 
-        let constrained_score = calculate_utility(
+        let constrained_score = ctx.utility(
             far_dune_desert_x,
             far_dune_desert_y,
-            &ctx.opt_nodes,
-            &ctx.spatial_grid,
             &config_constrained,
-            ctx.num_resources,
-            &ctx.weights_arr,
-            &ctx.epsilons_arr,
-            &ctx.res_to_idx,
-            &ctx.waterwell_nodes,
-            &ctx.land_mask,
+            EvalQuality::Fine,
         );
-        let ignored_score = calculate_utility(
+        let ignored_score = ctx.utility(
             far_dune_desert_x,
             far_dune_desert_y,
-            &ctx.opt_nodes,
-            &ctx.spatial_grid,
             &config_ignored,
-            ctx.num_resources,
-            &ctx.weights_arr,
-            &ctx.epsilons_arr,
-            &ctx.res_to_idx,
-            &ctx.waterwell_nodes,
-            &ctx.land_mask,
+            EvalQuality::Fine,
         );
 
         assert!(ignored_score > constrained_score);
@@ -1321,19 +1382,7 @@ mod tests {
         config.sigma = 500.0;
 
         let ctx = prepare_context(&nodes, &config);
-        let result = run_hill_climbing(
-            0.0,
-            0.0,
-            &ctx.opt_nodes,
-            &ctx.spatial_grid,
-            &config,
-            ctx.num_resources,
-            &ctx.weights_arr,
-            &ctx.epsilons_arr,
-            &ctx.res_to_idx,
-            &ctx.waterwell_nodes,
-            &ctx.land_mask,
-        );
+        let result = ctx.refine_from(0.0, 0.0, &config);
 
         assert_eq!(result.obstructed_nodes.get("Normal iron"), Some(&1));
         assert_eq!(result.local_nodes.get("Normal iron"), None);
@@ -1351,19 +1400,7 @@ mod tests {
         config.sigma = 500.0;
 
         let ctx = prepare_context(&nodes, &config);
-        let result = run_hill_climbing(
-            140000.0,
-            230000.0,
-            &ctx.opt_nodes,
-            &ctx.spatial_grid,
-            &config,
-            ctx.num_resources,
-            &ctx.weights_arr,
-            &ctx.epsilons_arr,
-            &ctx.res_to_idx,
-            &ctx.waterwell_nodes,
-            &ctx.land_mask,
-        );
+        let result = ctx.refine_from(140000.0, 230000.0, &config);
 
         assert!(result.resource_yields.get("water").copied().unwrap_or(0.0) > 0.0);
     }
@@ -1387,6 +1424,27 @@ mod tests {
         assert_eq!(ctx.land_mask.points.len(), LAND_MASK_SECTORS);
         for node in &ctx.opt_nodes {
             assert!(is_in_polygon(node.x, node.y, &ctx.land_mask.points));
+            assert!(
+                ctx.land_accel.sample(node.x, node.y).is_some(),
+                "land accel should cover node at ({}, {})",
+                node.x,
+                node.y
+            );
         }
+    }
+
+    #[test]
+    fn land_accel_inland_skips_exact_border_distance() {
+        let nodes = crate::data_loader::load_default_nodes();
+        let config = OptimizerConfig::default();
+        let ctx = prepare_context(&nodes, &config);
+        // Grass Fields-ish interior point far from the map polygon edge.
+        let x = -50_000.0;
+        let y = -50_000.0;
+        let field = ctx.land_accel.sample(x, y).expect("interior land");
+        assert!(field >= BORDER_MARGIN_CM);
+        let penalty = land_border_penalty(x, y, &ctx.land_mask, &ctx.land_accel, EvalQuality::Fine)
+            .expect("inland");
+        assert!((penalty - 1.0).abs() < f64::EPSILON);
     }
 }

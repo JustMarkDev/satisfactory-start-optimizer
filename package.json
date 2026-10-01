@@ -12,6 +12,7 @@
     "build": "vp build",
     "check": "vp check",
     "test": "bun test",
+    "bench": "cargo bench --bench optimizer",
     "check:fix": "vp check --fix",
     "pack": "vp pack src/app.js --from-vite --out-dir dist/pack",
     "preview": "vp preview",

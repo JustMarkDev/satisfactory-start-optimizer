@@ -1,9 +1,7 @@
-mod data_loader;
-mod models;
-mod optimizer;
-mod server;
-
-use models::{OptimizerConfig, PurityOverride};
+use satisfactory_start_optimizer::data_loader;
+use satisfactory_start_optimizer::models::{self, OptimizerConfig, PurityOverride};
+use satisfactory_start_optimizer::optimizer;
+use satisfactory_start_optimizer::server;
 use std::collections::HashMap;
 use std::env;
 
