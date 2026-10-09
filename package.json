@@ -23,12 +23,21 @@
     "bench": "cargo bench --bench optimizer",
     "pack": "vp pack src/app.js --from-vite --out-dir dist/pack",
     "preview": "vp preview",
-    "run": "vp run"
+    "run": "vp run",
+    "prepare": "vp config"
   },
   "devDependencies": {
-    "vite-plus": "^1.0.0"
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.1.0",
+    "vite-plus": "1.1.0"
   },
   "overrides": {
-    "vite": "npm:@voidzero-dev/vite-plus-core@1.0.0"
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.1.0"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "bun",
+      "version": "1.4.2",
+      "onFail": "download"
+    }
   }
 }
